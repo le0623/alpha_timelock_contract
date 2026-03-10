@@ -1,17 +1,17 @@
 #![cfg_attr(not(feature = "std"), no_std, no_main)]
 
-//! # Alpha Vault — Timelock Contract
+//! # Alpha Vault — Single-Use Timelock Contract
 //!
-//! Manages coldkey ownership of alpha (subnet stake) for a lock period.
-//! The hotkey and the staking position on the subnet remain unchanged throughout.
+//! One contract instance = one trade. Deploy a fresh instance per trade.
 //!
 //! Flow:
-//! 1. Backend: `transfer_stake(escrow → contract coldkey, hotkey, netuid)`
-//!    — ownership moves to the contract; alpha stays on the same hotkey.
-//! 2. Backend: `contract.lock(filler, hotkey, netuid, amount, lock_blocks)`
-//!    — records who receives ownership after the lock expires.
-//! 3. Filler: `contract.release(deposit_id)` after lock expires
-//!    — ownership transfers from contract coldkey → filler coldkey (hotkey, subnet).
+//! 1. Escrow: `transfer_stake(escrow → contract coldkey, hotkey, netuid)`
+//!    — alpha ownership moves to the contract.
+//! 2. Escrow: `contract.lock(buyer_coldkey, hotkey, netuid, amount, lock_blocks)`
+//!    — callable exactly once; records the buyer and seals the contract.
+//!    — after this call no further state-changing calls are accepted except `release`.
+//! 3. Buyer: `contract.release()` after lock expires
+//!    — ownership transfers from contract coldkey → buyer coldkey.
 
 // ── Chain Extension ──────────────────────────────────────────────────────────
 
@@ -29,9 +29,15 @@ pub enum SubtensorError {
     SlippageTooHigh,
     SubnetNotExists,
     HotKeyNotRegisteredInSubNet,
+    SameAutoStakeHotkeyAlreadySet,
     InsufficientBalance,
     AmountTooLow,
     InsufficientLiquidity,
+    SameNetuid,
+    ProxyTooMany,
+    ProxyDuplicate,
+    ProxyNoSelfProxy,
+    ProxyNotFound,
     Unknown(u32),
 }
 
@@ -49,9 +55,15 @@ impl ink::env::chain_extension::FromStatusCode for SubtensorError {
             8  => Err(SubtensorError::SlippageTooHigh),
             9  => Err(SubtensorError::SubnetNotExists),
             10 => Err(SubtensorError::HotKeyNotRegisteredInSubNet),
+            11 => Err(SubtensorError::SameAutoStakeHotkeyAlreadySet),
             12 => Err(SubtensorError::InsufficientBalance),
             13 => Err(SubtensorError::AmountTooLow),
             14 => Err(SubtensorError::InsufficientLiquidity),
+            15 => Err(SubtensorError::SameNetuid),
+            16 => Err(SubtensorError::ProxyTooMany),
+            17 => Err(SubtensorError::ProxyDuplicate),
+            18 => Err(SubtensorError::ProxyNoSelfProxy),
+            19 => Err(SubtensorError::ProxyNotFound),
             n  => Err(SubtensorError::Unknown(n)),
         }
     }
@@ -68,13 +80,15 @@ impl From<ink::scale::Error> for SubtensorError {
 pub trait SubtensorExtension {
     type ErrorCode = SubtensorError;
 
-    /// Transfer stake ownership between coldkeys.
     /// Transfers coldkey ownership of alpha to `destination_coldkey`.
     /// The hotkey and subnet position are unchanged.
+    ///
+    /// Parameter order matches the Subtensor chain extension (function 6):
+    /// `(destination_coldkey, hotkey, origin_netuid, destination_netuid, alpha_amount)`
     #[ink(function = 6, handle_status = true)]
     fn transfer_stake(
-        hotkey: ink::primitives::AccountId,
         destination_coldkey: ink::primitives::AccountId,
+        hotkey: ink::primitives::AccountId,
         origin_netuid: u16,
         destination_netuid: u16,
         alpha_amount: u64,
@@ -85,7 +99,6 @@ pub trait SubtensorExtension {
 
 #[ink::contract(env = crate::SubtensorEnvironment)]
 mod alpha_vault {
-    use ink::storage::Mapping;
     use crate::SubtensorError;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,35 +115,42 @@ mod alpha_vault {
         type ChainExtension = crate::SubtensorExtension;
     }
 
+    // ── Storage ───────────────────────────────────────────────────────────────
+
+    /// State machine:
+    ///   Unlocked  →  (escrow calls lock())  →  Locked
+    ///   Locked    →  (buyer calls release() after expiry)  →  Released
     #[derive(Debug, Clone, PartialEq, Eq)]
     #[ink::scale_derive(Encode, Decode, TypeInfo)]
     #[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
-    pub struct LockRecord {
-        pub filler_coldkey: AccountId,  // receives coldkey ownership on release
-        pub hotkey: AccountId,          // unchanged throughout; alpha stays on this hotkey
-        pub netuid: u16,
-        pub amount: u64,                // alpha in rao (1 alpha = 1e9 rao)
-        pub lock_start: BlockNumber,
-        pub lock_until: BlockNumber,
-        pub released: bool,
+    #[allow(clippy::cast_possible_truncation)]
+    pub enum VaultState {
+        /// No lock registered yet; only `lock()` is accepted.
+        Unlocked,
+        /// Lock registered; only `release()` is accepted.
+        Locked {
+            buyer_coldkey: AccountId,
+            hotkey: AccountId,
+            netuid: u16,
+            amount: u64,
+            lock_until: BlockNumber,
+        },
+        /// Alpha has been released to the buyer; contract is inert.
+        Released,
     }
 
     #[ink(storage)]
     pub struct AlphaVault {
-        owner: AccountId,               // backend operator
-        next_id: u64,
-        locks: Mapping<u64, LockRecord>,
-        min_lock_blocks: BlockNumber,
-        total_locks: u64,
-        total_released: u64,
+        escrow: AccountId,
+        state: VaultState,
     }
+
+    // ── Events ────────────────────────────────────────────────────────────────
 
     #[ink(event)]
     pub struct Locked {
         #[ink(topic)]
-        pub deposit_id: u64,
-        #[ink(topic)]
-        pub filler_coldkey: AccountId,
+        pub buyer_coldkey: AccountId,
         pub hotkey: AccountId,
         pub netuid: u16,
         pub amount: u64,
@@ -140,232 +160,186 @@ mod alpha_vault {
     #[ink(event)]
     pub struct Released {
         #[ink(topic)]
-        pub deposit_id: u64,
-        #[ink(topic)]
-        pub filler_coldkey: AccountId,
+        pub buyer_coldkey: AccountId,
         pub amount: u64,
         pub released_at: BlockNumber,
     }
 
-    #[ink(event)]
-    pub struct OwnerChanged {
-        pub old_owner: AccountId,
-        pub new_owner: AccountId,
-    }
+    // ── Errors ────────────────────────────────────────────────────────────────
 
     #[derive(Debug, PartialEq, Eq)]
     #[ink::scale_derive(Encode, Decode, TypeInfo)]
     #[allow(clippy::cast_possible_truncation)]
     pub enum Error {
-        NotOwner,
-        NotFiller,
-        LockNotFound,
+        /// `lock()` was called by someone other than the escrow (deployer).
+        NotEscrow,
+        /// `lock()` was called but a lock already exists.
+        AlreadyLocked,
+        /// `release()` was called but no lock has been registered yet.
+        NotLocked,
+        /// `release()` was called but the alpha was already released.
         AlreadyReleased,
+        /// Caller is not the registered buyer.
+        NotBuyer,
+        /// Lock period has not expired yet.
         LockNotExpired,
-        InvalidLockPeriod,
+        /// Amount must be greater than zero.
         ZeroAmount,
+        /// Lock duration must be greater than zero.
+        ZeroLockBlocks,
+        /// The chain extension call to `transfer_stake` failed.
         TransferStakeFailed(SubtensorError),
     }
 
     pub type Result<T> = core::result::Result<T, Error>;
 
+    // ── Messages ──────────────────────────────────────────────────────────────
+
     impl AlphaVault {
-        /// Deploy. `min_lock_blocks` = minimum allowed lock duration (0 = no minimum).
+        /// Deploy a fresh vault. The deployer (caller) is recorded as the escrow —
+        /// the only account permitted to call `lock()`.
         #[ink(constructor)]
-        pub fn new(min_lock_blocks: BlockNumber) -> Self {
+        pub fn new() -> Self {
             Self {
-                owner: Self::env().caller(),
-                next_id: 0,
-                locks: Mapping::default(),
-                min_lock_blocks,
-                total_locks: 0,
-                total_released: 0,
+                escrow: Self::env().caller(),
+                state: VaultState::Unlocked,
             }
         }
 
-        /// Record a new lock. Owner only.
-        /// Call after `transfer_stake(escrow → contract coldkey)` has already been executed,
-        /// so the contract coldkey already owns the alpha on `hotkey`.
-        /// `amount` is in rao units (1 alpha = 1_000_000_000 rao).
+        /// Register the lock. Callable exactly once, only by the escrow (deployer).
+        ///
+        /// Must be called after `transfer_stake(escrow → contract coldkey)` so the
+        /// contract already owns the alpha. After this call the only accepted
+        /// state-changing message is `release()` by the buyer.
         #[ink(message)]
         pub fn lock(
             &mut self,
-            filler_coldkey: AccountId,
+            buyer_coldkey: AccountId,
             hotkey: AccountId,
             netuid: u16,
             amount: u64,
             lock_blocks: BlockNumber,
-        ) -> Result<u64> {
-            if self.env().caller() != self.owner {
-                return Err(Error::NotOwner);
+        ) -> Result<()> {
+            if self.env().caller() != self.escrow {
+                return Err(Error::NotEscrow);
             }
+
+            match self.state {
+                VaultState::Unlocked => {}
+                VaultState::Locked { .. } | VaultState::Released => {
+                    return Err(Error::AlreadyLocked);
+                }
+            }
+
             if amount == 0 {
                 return Err(Error::ZeroAmount);
             }
-            if lock_blocks == 0 || lock_blocks < self.min_lock_blocks {
-                return Err(Error::InvalidLockPeriod);
+            if lock_blocks == 0 {
+                return Err(Error::ZeroLockBlocks);
             }
 
             let current_block = self.env().block_number();
             let lock_until = current_block.saturating_add(lock_blocks);
-            let deposit_id = self.next_id;
-            self.next_id = self.next_id.saturating_add(1);
 
-            self.locks.insert(deposit_id, &LockRecord {
-                filler_coldkey,
+            self.state = VaultState::Locked {
+                buyer_coldkey,
                 hotkey,
                 netuid,
                 amount,
-                lock_start: current_block,
                 lock_until,
-                released: false,
-            });
-            self.total_locks = self.total_locks.saturating_add(1);
+            };
 
             self.env().emit_event(Locked {
-                deposit_id,
-                filler_coldkey,
+                buyer_coldkey,
                 hotkey,
                 netuid,
                 amount,
                 lock_until,
             });
 
-            Ok(deposit_id)
+            Ok(())
         }
 
-        /// Transfer alpha ownership to the filler. Filler only, after lock expires.
-        /// Alpha does not move — only coldkey ownership transfers from the contract to the filler.
+        /// Release alpha to the buyer. Callable **only by the buyer**, after the lock expires.
+        ///
+        /// Transfers coldkey ownership from the contract to the buyer.
         /// The hotkey and subnet position remain unchanged.
         #[ink(message)]
-        pub fn release(&mut self, deposit_id: u64) -> Result<()> {
-            let mut record = self.locks.get(deposit_id).ok_or(Error::LockNotFound)?;
+        pub fn release(&mut self) -> Result<()> {
+            let (buyer_coldkey, hotkey, netuid, amount, lock_until) = match self.state {
+                VaultState::Unlocked => return Err(Error::NotLocked),
+                VaultState::Released => return Err(Error::AlreadyReleased),
+                VaultState::Locked { buyer_coldkey, hotkey, netuid, amount, lock_until } => {
+                    (buyer_coldkey, hotkey, netuid, amount, lock_until)
+                }
+            };
 
-            if record.released {
-                return Err(Error::AlreadyReleased);
+            if self.env().caller() != buyer_coldkey {
+                return Err(Error::NotBuyer);
             }
-            if self.env().caller() != record.filler_coldkey {
-                return Err(Error::NotFiller);
-            }
+
             let current_block = self.env().block_number();
-            if current_block < record.lock_until {
+            if current_block < lock_until {
                 return Err(Error::LockNotExpired);
             }
 
-            record.released = true;
-            self.locks.insert(deposit_id, &record);
-            self.total_released = self.total_released.saturating_add(1);
-
+            // Perform the external transfer before updating state so that a
+            // failed transfer leaves the vault in Locked (not Released).
             self.env()
                 .extension()
-                .transfer_stake(record.hotkey, record.filler_coldkey, record.netuid, record.netuid, record.amount)
+                .transfer_stake(buyer_coldkey, hotkey, netuid, netuid, amount)
                 .map_err(Error::TransferStakeFailed)?;
 
+            self.state = VaultState::Released;
+
             self.env().emit_event(Released {
-                deposit_id,
-                filler_coldkey: record.filler_coldkey,
-                amount: record.amount,
+                buyer_coldkey,
+                amount,
                 released_at: current_block,
             });
 
             Ok(())
         }
 
-        /// Force ownership transfer before expiry. Owner only.
-        /// Ownership still goes to the filler — owner cannot redirect it elsewhere.
+        // ── Read-only queries ─────────────────────────────────────────────────
+
+        /// Returns the escrow (deployer) account that is allowed to call `lock()`.
         #[ink(message)]
-        pub fn emergency_release(&mut self, deposit_id: u64) -> Result<()> {
-            if self.env().caller() != self.owner {
-                return Err(Error::NotOwner);
-            }
-
-            let mut record = self.locks.get(deposit_id).ok_or(Error::LockNotFound)?;
-
-            if record.released {
-                return Err(Error::AlreadyReleased);
-            }
-
-            record.released = true;
-            self.locks.insert(deposit_id, &record);
-            self.total_released = self.total_released.saturating_add(1);
-
-            self.env()
-                .extension()
-                .transfer_stake(record.hotkey, record.filler_coldkey, record.netuid, record.netuid, record.amount)
-                .map_err(Error::TransferStakeFailed)?;
-
-            let current_block = self.env().block_number();
-            self.env().emit_event(Released {
-                deposit_id,
-                filler_coldkey: record.filler_coldkey,
-                amount: record.amount,
-                released_at: current_block,
-            });
-
-            Ok(())
+        pub fn get_escrow(&self) -> AccountId {
+            self.escrow
         }
 
-        /// Set minimum lock period. Owner only.
+        /// Returns the current vault state.
         #[ink(message)]
-        pub fn set_min_lock_blocks(&mut self, blocks: BlockNumber) -> Result<()> {
-            if self.env().caller() != self.owner {
-                return Err(Error::NotOwner);
-            }
-            self.min_lock_blocks = blocks;
-            Ok(())
+        pub fn get_state(&self) -> VaultState {
+            self.state.clone()
         }
 
-        /// Transfer ownership. Owner only.
+        /// Returns true if a lock is registered and the lock period has not expired.
         #[ink(message)]
-        pub fn transfer_ownership(&mut self, new_owner: AccountId) -> Result<()> {
-            if self.env().caller() != self.owner {
-                return Err(Error::NotOwner);
-            }
-            let old = self.owner;
-            self.owner = new_owner;
-            self.env().emit_event(OwnerChanged { old_owner: old, new_owner });
-            Ok(())
-        }
-
-        #[ink(message)]
-        pub fn is_locked(&self, deposit_id: u64) -> bool {
-            match self.locks.get(deposit_id) {
-                Some(r) => !r.released && self.env().block_number() < r.lock_until,
-                None => false,
+        pub fn is_locked(&self) -> bool {
+            match self.state {
+                VaultState::Locked { lock_until, .. } => {
+                    self.env().block_number() < lock_until
+                }
+                _ => false,
             }
         }
 
+        /// Returns the number of blocks remaining until the lock expires (0 if not locked or expired).
         #[ink(message)]
-        pub fn blocks_remaining(&self, deposit_id: u64) -> BlockNumber {
-            match self.locks.get(deposit_id) {
-                Some(r) if !r.released => {
+        pub fn blocks_remaining(&self) -> BlockNumber {
+            match self.state {
+                VaultState::Locked { lock_until, .. } => {
                     let current = self.env().block_number();
-                    if current < r.lock_until { r.lock_until.saturating_sub(current) } else { 0 }
+                    if current < lock_until { lock_until.saturating_sub(current) } else { 0 }
                 }
                 _ => 0,
             }
         }
-
-        #[ink(message)]
-        pub fn get_lock(&self, deposit_id: u64) -> Option<LockRecord> {
-            self.locks.get(deposit_id)
-        }
-
-        #[ink(message)]
-        pub fn get_next_id(&self) -> u64 { self.next_id }
-
-        #[ink(message)]
-        pub fn get_owner(&self) -> AccountId { self.owner }
-
-        #[ink(message)]
-        pub fn get_min_lock_blocks(&self) -> BlockNumber { self.min_lock_blocks }
-
-        #[ink(message)]
-        pub fn get_total_locks(&self) -> u64 { self.total_locks }
-
-        #[ink(message)]
-        pub fn get_total_released(&self) -> u64 { self.total_released }
     }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
 
     #[cfg(test)]
     mod tests {
@@ -386,124 +360,122 @@ mod alpha_vault {
         }
 
         #[ink::test]
-        fn constructor_works() {
+        fn constructor_starts_unlocked() {
             let a = accounts();
             set_caller(a.alice);
-            let vault = AlphaVault::new(10);
-            assert_eq!(vault.get_owner(), a.alice);
-            assert_eq!(vault.get_min_lock_blocks(), 10);
-            assert_eq!(vault.get_next_id(), 0);
+            let vault = AlphaVault::new();
+            assert_eq!(vault.get_escrow(), a.alice);
+            assert_eq!(vault.get_state(), VaultState::Unlocked);
+            assert!(!vault.is_locked());
+            assert_eq!(vault.blocks_remaining(), 0);
         }
 
         #[ink::test]
         fn lock_records_correctly() {
             let a = accounts();
-            set_caller(a.alice);
-            let mut vault = AlphaVault::new(5);
+            set_caller(a.alice); // alice = escrow
+            let mut vault = AlphaVault::new();
 
-            let id = vault.lock(a.bob, a.charlie, 1, 1_000_000_000, 10).expect("lock failed");
+            vault.lock(a.bob, a.charlie, 1, 1_000_000_000, 10).expect("lock failed");
 
-            assert_eq!(id, 0);
-            assert!(vault.is_locked(id));
-            assert_eq!(vault.blocks_remaining(id), 10);
-            assert_eq!(vault.get_total_locks(), 1);
+            assert!(vault.is_locked());
+            assert_eq!(vault.blocks_remaining(), 10);
 
-            let rec = vault.get_lock(id).expect("record missing");
-            assert_eq!(rec.filler_coldkey, a.bob);
-            assert_eq!(rec.hotkey, a.charlie);
-            assert_eq!(rec.netuid, 1);
-            assert_eq!(rec.amount, 1_000_000_000);
-            assert!(!rec.released);
+            match vault.get_state() {
+                VaultState::Locked { buyer_coldkey, hotkey, netuid, amount, .. } => {
+                    assert_eq!(buyer_coldkey, a.bob);
+                    assert_eq!(hotkey, a.charlie);
+                    assert_eq!(netuid, 1);
+                    assert_eq!(amount, 1_000_000_000);
+                }
+                _ => panic!("expected Locked state"),
+            }
         }
 
         #[ink::test]
-        fn non_owner_cannot_lock() {
+        fn lock_can_only_be_called_once() {
             let a = accounts();
             set_caller(a.alice);
-            let mut vault = AlphaVault::new(5);
-            set_caller(a.bob);
-            assert_eq!(vault.lock(a.charlie, a.django, 1, 1_000_000_000, 10), Err(Error::NotOwner));
+            let mut vault = AlphaVault::new();
+
+            vault.lock(a.bob, a.charlie, 1, 1_000_000_000, 10).expect("first lock failed");
+            // second call must fail
+            assert_eq!(
+                vault.lock(a.bob, a.charlie, 1, 1_000_000_000, 10),
+                Err(Error::AlreadyLocked)
+            );
+        }
+
+        #[ink::test]
+        fn non_escrow_cannot_lock() {
+            let a = accounts();
+            set_caller(a.alice); // alice deploys → she is the escrow
+            let mut vault = AlphaVault::new();
+            set_caller(a.bob); // bob tries to lock
+            assert_eq!(
+                vault.lock(a.bob, a.charlie, 1, 1_000_000_000, 10),
+                Err(Error::NotEscrow)
+            );
         }
 
         #[ink::test]
         fn zero_amount_rejected() {
             let a = accounts();
             set_caller(a.alice);
-            let mut vault = AlphaVault::new(5);
+            let mut vault = AlphaVault::new();
             assert_eq!(vault.lock(a.bob, a.charlie, 1, 0, 10), Err(Error::ZeroAmount));
         }
 
         #[ink::test]
-        fn lock_period_too_short() {
+        fn zero_lock_blocks_rejected() {
             let a = accounts();
             set_caller(a.alice);
-            let mut vault = AlphaVault::new(10);
-            assert_eq!(vault.lock(a.bob, a.charlie, 1, 1_000_000_000, 5), Err(Error::InvalidLockPeriod));
+            let mut vault = AlphaVault::new();
+            assert_eq!(vault.lock(a.bob, a.charlie, 1, 1_000_000_000, 0), Err(Error::ZeroLockBlocks));
+        }
+
+        #[ink::test]
+        fn release_without_lock_rejected() {
+            let a = accounts();
+            set_caller(a.bob);
+            let mut vault = AlphaVault::new();
+            assert_eq!(vault.release(), Err(Error::NotLocked));
         }
 
         #[ink::test]
         fn release_before_expiry_rejected() {
             let a = accounts();
             set_caller(a.alice);
-            let mut vault = AlphaVault::new(5);
+            let mut vault = AlphaVault::new();
             vault.lock(a.bob, a.charlie, 1, 1_000_000_000, 10).expect("lock failed");
             set_caller(a.bob);
-            assert_eq!(vault.release(0), Err(Error::LockNotExpired));
+            assert_eq!(vault.release(), Err(Error::LockNotExpired));
         }
 
         #[ink::test]
-        fn non_filler_cannot_release() {
+        fn non_buyer_cannot_release() {
             let a = accounts();
             set_caller(a.alice);
-            let mut vault = AlphaVault::new(5);
+            let mut vault = AlphaVault::new();
             vault.lock(a.bob, a.charlie, 1, 1_000_000_000, 10).expect("lock failed");
             advance_blocks(11);
-            set_caller(a.charlie); // hotkey, not filler
-            assert_eq!(vault.release(0), Err(Error::NotFiller));
-        }
-
-        #[ink::test]
-        fn lock_not_found() {
-            let a = accounts();
-            set_caller(a.alice);
-            let mut vault = AlphaVault::new(5);
-            set_caller(a.bob);
-            assert_eq!(vault.release(99), Err(Error::LockNotFound));
+            set_caller(a.charlie); // hotkey, not buyer
+            assert_eq!(vault.release(), Err(Error::NotBuyer));
         }
 
         #[ink::test]
         fn blocks_remaining_decreases() {
             let a = accounts();
             set_caller(a.alice);
-            let mut vault = AlphaVault::new(5);
+            let mut vault = AlphaVault::new();
             vault.lock(a.bob, a.charlie, 1, 1_000_000_000, 10).expect("lock failed");
 
-            assert_eq!(vault.blocks_remaining(0), 10);
+            assert_eq!(vault.blocks_remaining(), 10);
             advance_blocks(5);
-            assert_eq!(vault.blocks_remaining(0), 5);
+            assert_eq!(vault.blocks_remaining(), 5);
             advance_blocks(5);
-            assert_eq!(vault.blocks_remaining(0), 0);
-            assert!(!vault.is_locked(0));
-        }
-
-        #[ink::test]
-        fn transfer_ownership_works() {
-            let a = accounts();
-            set_caller(a.alice);
-            let mut vault = AlphaVault::new(5);
-            vault.transfer_ownership(a.bob).expect("transfer failed");
-            assert_eq!(vault.get_owner(), a.bob);
-            assert_eq!(vault.set_min_lock_blocks(20), Err(Error::NotOwner));
-        }
-
-        #[ink::test]
-        fn non_owner_cannot_emergency_release() {
-            let a = accounts();
-            set_caller(a.alice);
-            let mut vault = AlphaVault::new(5);
-            vault.lock(a.bob, a.charlie, 1, 1_000_000_000, 100).expect("lock failed");
-            set_caller(a.bob);
-            assert_eq!(vault.emergency_release(0), Err(Error::NotOwner));
+            assert_eq!(vault.blocks_remaining(), 0);
+            assert!(!vault.is_locked());
         }
     }
 }
